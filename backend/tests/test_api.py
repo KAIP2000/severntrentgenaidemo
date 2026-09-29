@@ -10,13 +10,19 @@ from langchain_core.messages import AIMessage, ToolMessage
 os.environ["AGENT_EXECUTION_MODE"] = "simulation"
 
 from app.agents.orchestrator import WaterOperationsHarness
+from app.agents.middleware import is_transient_model_error
 from app.config import Settings
 from app.data import DATA_NOW, ENVIRONMENT, generate_environment
 from app.main import app
 from app.schemas import AgentFinalResponse
 from app.agents.deep_agent import SYSTEM_PROMPT
 from app.tools.capabilities import list_capabilities
+from app.tools.environment import get_weather_forecast, get_weather_history
+from app.tools.supply import list_network_assets
+from app.tools import SUPPLY_TOOLS
+from app.tools.common import as_recoverable_tool
 from app.tools.river import compare_river_flows, get_river_flow_history, list_rivers
+from app.tools.supply import get_asset_history
 
 
 def final_response(status="complete", title="Answer", answer="Done.", evidence_ids=None):
@@ -52,6 +58,21 @@ class FailingAgent:
         return SimpleNamespace(values={}, tasks=())
 
 
+class FinalizationRetryAgent:
+    def __init__(self):
+        self.calls = 0
+        self.final = final_response(answer="Completed on finalization retry.")
+
+    async def astream(self, _input_value, **_kwargs):
+        self.calls += 1
+        if False:
+            yield None
+
+    async def aget_state(self, _config):
+        values = {"structured_response": self.final} if self.calls >= 2 else {}
+        return SimpleNamespace(values=values, tasks=())
+
+
 class ApprovalAgent:
     def __init__(self):
         self.resumed = False
@@ -77,6 +98,42 @@ async def wait_terminal(harness, investigation_id, terminal=None):
             return record
         await asyncio.sleep(0.005)
     raise AssertionError("investigation did not reach a terminal state")
+
+
+def track_thread_deletions(harness):
+    deleted = []
+    original = harness.checkpointer.adelete_thread
+
+    async def tracked(thread_id):
+        deleted.append(thread_id)
+        await original(thread_id)
+
+    harness.checkpointer.adelete_thread = tracked
+    return deleted
+
+
+async def wait_for_deletions(deleted, count):
+    for _ in range(200):
+        if len(deleted) >= count:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"expected {count} thread deletions, got {len(deleted)}")
+
+
+def test_keep_threads_setting_reads_environment(monkeypatch):
+    monkeypatch.setenv("KEEP_THREADS", "true")
+    assert Settings().keep_threads is True
+
+
+def test_model_retry_filter_targets_transient_provider_failures_only():
+    unavailable = RuntimeError("503 UNAVAILABLE: model currently experiencing high demand")
+    bad_request = RuntimeError("400 INVALID_ARGUMENT")
+    class ReadTimeout(Exception):
+        pass
+
+    assert is_transient_model_error(unavailable) is True
+    assert is_transient_model_error(ReadTimeout()) is True
+    assert is_transient_model_error(bad_request) is False
 
 
 def test_five_rivers_have_exact_ordered_seeded_histories_and_scenario_signatures():
@@ -118,6 +175,14 @@ def test_named_last_couple_days_returns_four_intervals_with_provenance_and_calcu
     assert {item["label"] for item in result["calculations"]} == {"Mean flow", "Period change", "Period change percent"}
 
 
+def test_weather_tools_resolve_a_river_id_to_its_canonical_catchment_id():
+    start = (DATA_NOW - timedelta(hours=48)).isoformat()
+    history = get_weather_history("river-alder", start, DATA_NOW.isoformat())
+    forecast = get_weather_forecast("river-alder", hours=24)
+    assert history["query"]["catchment_id"] == "alder-catchment"
+    assert forecast["query"]["catchment_id"] == "alder-catchment"
+
+
 def test_network_comparison_requires_explicit_ids_and_covers_all_five():
     ids = list(ENVIRONMENT["rivers"])
     result = compare_river_flows(ids, (DATA_NOW - timedelta(days=7)).isoformat(), DATA_NOW.isoformat())
@@ -131,6 +196,52 @@ def test_capability_questions_are_model_directed_to_an_observable_registry_tool(
     assert result["source"] == "Water Operations Capability Registry"
     assert len(result["records"]) == 4
     assert result["provenance"]["synthetic"] is True
+
+
+def test_supply_subagent_has_the_river_registry_before_forecasting():
+    assert list_rivers in SUPPLY_TOOLS
+
+
+def test_recoverable_tool_returns_bad_model_arguments_to_the_agent():
+    tool = as_recoverable_tool(get_asset_history)
+    result = tool.invoke({
+        "dataset": "incidents",
+        "asset_ids": ["INC-1042"],
+        "start": (DATA_NOW - timedelta(days=7)).isoformat(),
+        "end": DATA_NOW.isoformat(),
+    })
+    assert "Invalid input for get_asset_history" in result
+    assert "sources, reservoirs, treatments, demand_zones" in result
+
+
+def test_system_prompt_routes_supply_categories_and_respects_no_execution_requests():
+    assert "never pass those categories to get_asset_history" in SYSTEM_PROMPT
+    assert "explicitly says not to execute" in SYSTEM_PROMPT
+    assert "invent a hypothetical deficit" in SYSTEM_PROMPT
+    assert "must not call list_rivers again" in SYSTEM_PROMPT
+    assert "do not call\nget_operational_options" in SYSTEM_PROMPT
+    assert "verify the stated horizon with run_supply_forecast" in SYSTEM_PROMPT
+    assert "action was not executed" in SYSTEM_PROMPT
+    assert "single slightly changed interval cannot establish an exact root cause" in SYSTEM_PROMPT
+    assert 'explicitly pass aggregation="12h"' in SYSTEM_PROMPT
+    assert "must not\ncause you to answer without making the governed tool call" in SYSTEM_PROMPT
+    assert "monitoring/no" in SYSTEM_PROMPT and "change as lower risk" in SYSTEM_PROMPT
+    assert "full available 30-day period with status open" in SYSTEM_PROMPT
+    assert "does not require the supply-forecaster" in SYSTEM_PROMPT
+    assert "do not repeat its successful tool calls" in SYSTEM_PROMPT
+    assert "explicit synthetic training drills" in SYSTEM_PROMPT
+    assert "set disposition to\nconflicting_evidence" in SYSTEM_PROMPT
+
+
+def test_network_asset_registry_accepts_river_aliases():
+    result = list_network_assets("rivers")
+    assert {item["id"] for item in result["records"]} == set(ENVIRONMENT["rivers"])
+
+
+def test_network_asset_registry_accepts_human_friendly_asset_type_aliases():
+    assert len(list_network_assets("source")["records"]) == 5
+    assert len(list_network_assets("reservoir")["records"]) == 3
+    assert list_network_assets("demand zone")["query"]["asset_type"] == "demand_zones"
 
 
 def test_ambiguous_river_script_clarifies_without_telemetry():
@@ -179,6 +290,92 @@ def test_session_order_thread_isolation_history_and_sse_cursor():
     asyncio.run(scenario())
 
 
+def test_terminal_threads_are_deleted_without_removing_session_history():
+    agent = ScriptedAgent([], final_response(answer="Evidence-backed response."))
+
+    async def scenario():
+        harness = WaterOperationsHarness(Settings(agent_execution_mode="simulation"), agent=agent)
+        deleted = track_thread_deletions(harness)
+        first = await harness.create("First question", "cleanup-session")
+        await wait_terminal(harness, first.investigation_id)
+        await wait_for_deletions(deleted, 1)
+        second = await harness.create("Follow-up question", "cleanup-session")
+        await wait_terminal(harness, second.investigation_id)
+        await wait_for_deletions(deleted, 2)
+
+        assert deleted == [first.thread_id, second.thread_id]
+        assert [item.investigation_id for item in harness.session("cleanup-session")] == [first.investigation_id, second.investigation_id]
+        assert [message["content"] for message in agent.inputs[1]["messages"]] == ["First question", "Evidence-backed response.", "Follow-up question"]
+
+        replay = []
+        async for payload in harness.event_stream(first.investigation_id):
+            if payload.startswith("id:"):
+                replay.append(payload)
+        assert replay[-1].splitlines()[1] == "event: run_completed"
+
+    asyncio.run(scenario())
+
+
+def test_clarification_and_failure_threads_are_deleted():
+    async def scenario():
+        cases = [
+            (ScriptedAgent([], final_response(status="clarification_required")), "clarification_required"),
+            (FailingAgent(), "failed"),
+        ]
+        for agent, expected_status in cases:
+            harness = WaterOperationsHarness(Settings(agent_execution_mode="simulation"), agent=agent)
+            deleted = track_thread_deletions(harness)
+            created = await harness.create("Question", f"{expected_status}-session")
+            record = await wait_terminal(harness, created.investigation_id)
+            await wait_for_deletions(deleted, 1)
+            assert record.status == expected_status
+            assert deleted == [created.thread_id]
+
+    asyncio.run(scenario())
+
+
+def test_keep_threads_setting_disables_terminal_cleanup():
+    async def scenario():
+        harness = WaterOperationsHarness(
+            Settings(agent_execution_mode="simulation", keep_threads=True),
+            agent=ScriptedAgent([], final_response()),
+        )
+        deleted = track_thread_deletions(harness)
+        created = await harness.create("Keep this thread", "retained-session")
+        record = await wait_terminal(harness, created.investigation_id)
+        while not record.events or record.events[-1].type != "run_completed":
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0)
+        assert deleted == []
+
+    asyncio.run(scenario())
+
+
+def test_thread_cleanup_failure_does_not_change_completed_result(caplog):
+    async def scenario():
+        harness = WaterOperationsHarness(
+            Settings(agent_execution_mode="simulation"),
+            agent=ScriptedAgent([], final_response(answer="Still complete.")),
+        )
+        attempted = asyncio.Event()
+
+        async def fail_cleanup(_thread_id):
+            attempted.set()
+            raise RuntimeError("cleanup unavailable")
+
+        harness.checkpointer.adelete_thread = fail_cleanup
+        created = await harness.create("Complete despite cleanup", "cleanup-error-session")
+        record = await wait_terminal(harness, created.investigation_id)
+        await asyncio.wait_for(attempted.wait(), timeout=1)
+        assert record.status == "complete"
+        assert record.error is None
+        assert record.final.answer_markdown == "Still complete."
+        assert record.events[-1].type == "run_completed"
+
+    asyncio.run(scenario())
+    assert "Failed to delete checkpoints for thread" in caplog.text
+
+
 def test_failure_emits_run_failed_without_fallback_evidence():
     async def scenario():
         harness = WaterOperationsHarness(Settings(agent_execution_mode="simulation"), agent=FailingAgent())
@@ -189,6 +386,19 @@ def test_failure_emits_run_failed_without_fallback_evidence():
         assert record.evidence == {}
         assert record.final is None
         assert record.events[-1].type == "run_failed"
+
+    asyncio.run(scenario())
+
+
+def test_missing_structured_response_gets_one_evidence_preserving_finalization_retry():
+    async def scenario():
+        agent = FinalizationRetryAgent()
+        harness = WaterOperationsHarness(Settings(agent_execution_mode="simulation"), agent=agent)
+        created = await harness.create("Finish this investigation", "finalization-retry")
+        record = await wait_terminal(harness, created.investigation_id)
+        assert record.status == "complete"
+        assert record.final.answer_markdown == "Completed on finalization retry."
+        assert agent.calls == 2
 
     asyncio.run(scenario())
 
@@ -217,12 +427,15 @@ def test_approval_resumes_exact_thread_and_leaves_sibling_unchanged():
     async def scenario():
         approval_agent = ApprovalAgent()
         harness = WaterOperationsHarness(Settings(agent_execution_mode="simulation"), agent=approval_agent)
+        deleted = track_thread_deletions(harness)
         pending = await harness.create("Take an action", "approval-session")
         pending_record = await wait_terminal(harness, pending.investigation_id, {"awaiting_approval"})
+        assert deleted == []
         sibling_agent = ScriptedAgent([], final_response(answer="Sibling complete."))
         harness.agent = sibling_agent
         sibling = await harness.create("Check something else", "approval-session")
         sibling_record = await wait_terminal(harness, sibling.investigation_id)
+        await wait_for_deletions(deleted, 1)
         sibling_thread = sibling_record.thread_id
         sibling_event_count = len(sibling_record.events)
 
@@ -230,7 +443,9 @@ def test_approval_resumes_exact_thread_and_leaves_sibling_unchanged():
         original_thread = pending_record.thread_id
         await harness.decide(pending.investigation_id, "approve")
         resumed = await wait_terminal(harness, pending.investigation_id, {"complete"})
+        await wait_for_deletions(deleted, 2)
         assert resumed.thread_id == original_thread
+        assert deleted == [sibling_thread, original_thread]
         assert harness.get(sibling.investigation_id).thread_id == sibling_thread
         assert len(harness.get(sibling.investigation_id).events) == sibling_event_count
 

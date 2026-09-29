@@ -40,6 +40,8 @@ class RunRecord:
     evidence: dict[str, Evidence] = field(default_factory=dict)
     final: AgentFinalResponse | None = None
     error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    decisions: list[str] = field(default_factory=list)
     events: list[StreamEvent] = field(default_factory=list)
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
 
@@ -67,6 +69,7 @@ class WaterOperationsHarness:
     """Gemini-owned execution with session grouping, isolated graph threads and replayable events."""
 
     TERMINAL = {"complete", "clarification_required", "awaiting_approval", "failed"}
+    THREAD_CLEANUP_TERMINAL = {"complete", "clarification_required", "failed"}
 
     def __init__(self, settings: Settings, agent: Any | None = None):
         self.settings = settings
@@ -79,7 +82,7 @@ class WaterOperationsHarness:
         self.investigations: dict[str, RunRecord] = {}
         self.sessions: dict[str, list[str]] = {}
 
-    async def create(self, question: str, session_id: str) -> RunRecord:
+    async def create(self, question: str, session_id: str, metadata: dict[str, Any] | None = None) -> RunRecord:
         investigation_id = f"INV-{_now():%Y%m%d}-{uuid4().hex[:8].upper()}"
         thread_id = f"THR-{uuid4().hex}"
         record = RunRecord(
@@ -89,6 +92,7 @@ class WaterOperationsHarness:
             question=question,
             model_provider=self.settings.model_provider,
             model_name=self.settings.model_name,
+            metadata=metadata or {},
         )
         self.investigations[investigation_id] = record
         self.sessions.setdefault(session_id, []).append(investigation_id)
@@ -101,10 +105,19 @@ class WaterOperationsHarness:
     def session(self, session_id: str) -> list[RunRecord]:
         return [self.investigations[item] for item in self.sessions.get(session_id, [])]
 
+    async def _cleanup_thread(self, record: RunRecord) -> None:
+        if self.settings.keep_threads or record.status not in self.THREAD_CLEANUP_TERMINAL:
+            return
+        try:
+            await self.checkpointer.adelete_thread(record.thread_id)
+        except Exception:
+            logger.exception("Failed to delete checkpoints for thread %s", record.thread_id)
+
     async def decide(self, investigation_id: str, decision: str) -> RunRecord:
         record = self.investigations[investigation_id]
         if record.status != "awaiting_approval":
             raise ValueError("Investigation is not awaiting approval")
+        record.decisions.append(decision)
         record.status = "running"
         record.updated_at = _now()
         resume = Command(resume={"decisions": [{"type": decision}]})
@@ -147,9 +160,17 @@ class WaterOperationsHarness:
             record.status = "failed"
             record.error = "Gemini is not configured. Set a valid API key and enable live execution."
             await self._emit(record, "run_failed", {"error": record.error})
+            await self._cleanup_thread(record)
             return
 
-        config = {"configurable": {"thread_id": record.thread_id}, "metadata": {"session_id": record.session_id, "investigation_id": record.investigation_id}}
+        config = {
+            "configurable": {"thread_id": record.thread_id},
+            "metadata": {
+                **record.metadata,
+                "session_id": record.session_id,
+                "investigation_id": record.investigation_id,
+            },
+        }
         input_value: Any = command or {"messages": [*self._history(record), {"role": "user", "content": record.question}]}
         try:
             async for chunk in self.agent.astream(
@@ -169,6 +190,30 @@ class WaterOperationsHarness:
                 return
 
             structured = snapshot.values.get("structured_response") if snapshot and snapshot.values else None
+            structured = structured or record.final
+            if structured is None:
+                completion_input = {
+                    "messages": [{
+                        "role": "user",
+                        "content": "Complete the investigation now by returning only the required validated structured final response. Use the evidence already collected; do not call additional tools or invent evidence.",
+                    }]
+                }
+                async for chunk in self.agent.astream(
+                    completion_input,
+                    config=config,
+                    stream_mode=["updates", "messages", "custom"],
+                    subgraphs=True,
+                    version="v2",
+                ):
+                    await self._consume_chunk(record, chunk)
+                snapshot = await self.agent.aget_state(config)
+                retry_interrupts = self._interrupts(snapshot)
+                if retry_interrupts:
+                    record.status = "awaiting_approval"
+                    await self._emit(record, "approval_required", {"requests": retry_interrupts})
+                    return
+                structured = snapshot.values.get("structured_response") if snapshot and snapshot.values else None
+                structured = structured or record.final
             if structured is None:
                 raise RuntimeError("Gemini completed without a validated structured response")
             record.final = structured if isinstance(structured, AgentFinalResponse) else AgentFinalResponse.model_validate(structured)
@@ -190,6 +235,8 @@ class WaterOperationsHarness:
             record.status = "failed"
             record.error = str(exc)
             await self._emit(record, "run_failed", {"error": record.error})
+        finally:
+            await self._cleanup_thread(record)
 
     @staticmethod
     def _interrupts(snapshot: Any) -> list[dict[str, Any]]:
@@ -207,14 +254,24 @@ class WaterOperationsHarness:
         unknown_citations = set(record.final.evidence_ids) - known
         if unknown_citations:
             raise RuntimeError(f"Gemini cited unknown evidence IDs: {', '.join(sorted(unknown_citations))}")
+        valid_charts = []
         for chart in record.final.charts:
             evidence = record.evidence.get(chart.evidence_id)
             if not evidence:
-                raise RuntimeError(f"Chart references unknown evidence ID: {chart.evidence_id}")
+                logger.warning("Skipping chart with unknown evidence ID: %s", chart.evidence_id)
+                continue
             available_fields = {key for row in evidence.records for key in row}
             missing_fields = {chart.x_field, *chart.y_fields} - available_fields
             if missing_fields:
-                raise RuntimeError(f"Chart references fields absent from evidence: {', '.join(sorted(missing_fields))}")
+                logger.warning(
+                    "Skipping chart %r with fields absent from evidence %s: %s",
+                    chart.title,
+                    chart.evidence_id,
+                    ", ".join(sorted(missing_fields)),
+                )
+                continue
+            valid_charts.append(chart)
+        record.final.charts = valid_charts
 
     async def _consume_chunk(self, record: RunRecord, chunk: Any) -> None:
         if not isinstance(chunk, dict):
@@ -291,6 +348,8 @@ class WaterOperationsHarness:
         activity.completed_at = _now()
         activity.duration_ms = max(0, int((activity.completed_at - activity.started_at).total_seconds() * 1000))
         usage = getattr(message, "usage_metadata", None) or {}
+        if isinstance(usage, dict):
+            activity.usage = {key: int(value) for key, value in usage.items() if isinstance(value, (int, float))}
         total_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
         activity.result_summary = f"Model call completed{f' · {total_tokens} tokens' if total_tokens is not None else ''}"
         await self._emit(record, "activity_completed", {"activity": activity.model_dump(mode="json")})
@@ -346,6 +405,15 @@ class WaterOperationsHarness:
         activity.duration_ms = max(0, int((activity.completed_at - activity.started_at).total_seconds() * 1000))
         if activity.tool:
             activity.tool.output = output
+            # Preserve the effective arguments after the tool applies defaults. This makes the
+            # observable trace reflect what actually ran, while retaining every model-supplied
+            # argument verbatim.
+            if isinstance(output, dict) and isinstance(output.get("query"), dict):
+                for key, value in output["query"].items():
+                    activity.tool.inputs.setdefault(key, value)
+        if getattr(message, "status", "success") == "error":
+            activity.status = "failed"
+            activity.error = output if isinstance(output, str) else json.dumps(output, default=str)[:500]
         if isinstance(output, dict) and output.get("evidence_id"):
             evidence = Evidence(
                 id=output["evidence_id"],

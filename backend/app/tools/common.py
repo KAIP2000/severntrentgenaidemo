@@ -2,10 +2,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import wraps
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
+
+from langchain_core.tools import StructuredTool, ToolException
 
 from app.data import DATA_NOW
+
+
+def as_recoverable_tool(func: Callable[..., Any]) -> StructuredTool:
+    """Expose a domain function without letting correctable input errors abort the graph."""
+
+    @wraps(func)
+    def guarded(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except ValueError as exc:
+            raise ToolException(f"Invalid input for {func.__name__}: {exc}") from exc
+
+    return StructuredTool.from_function(
+        func=guarded,
+        handle_tool_error=lambda exc: str(exc),
+        handle_validation_error=lambda exc: f"Invalid arguments for {func.__name__}: {exc}",
+    )
 
 
 def parse_time(value: str) -> datetime:

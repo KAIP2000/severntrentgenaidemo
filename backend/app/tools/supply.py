@@ -1,5 +1,4 @@
 from statistics import mean
-
 from app.data import ENVIRONMENT
 from app.tools.common import calculation, envelope, filter_rows, parse_time
 
@@ -12,8 +11,38 @@ DATASETS = {
 }
 
 
+ASSET_TYPE_ALIASES = {
+    "source": "sources",
+    "sources": "sources",
+    "reservoir": "reservoirs",
+    "reservoirs": "reservoirs",
+    "treatment": "treatments",
+    "treatments": "treatments",
+    "demand_zone": "demand_zones",
+    "demand_zones": "demand_zones",
+    "demand zone": "demand_zones",
+    "incident": "incidents",
+    "incidents": "incidents",
+    "maintenance": "maintenance",
+    "catchment": "catchments",
+    "catchments": "catchments",
+    "connection": "connections",
+    "connections": "connections",
+    "river": "rivers",
+    "rivers": "rivers",
+}
+
+
+def _resolve_asset_type(asset_type: str) -> str:
+    normalized = "_".join(asset_type.strip().lower().split())
+    resolved = ASSET_TYPE_ALIASES.get(normalized)
+    if resolved:
+        return resolved
+    raise ValueError("Unsupported asset_type. Use one of: sources, reservoirs, treatments, demand_zones, incidents, maintenance, catchments, connections, rivers")
+
+
 def get_asset_history(dataset: str, asset_ids: list[str], start: str, end: str) -> dict:
-    """Retrieve source, reservoir, treatment or demand-zone history for explicit asset IDs."""
+    """Retrieve history for explicit asset IDs. Dataset must be sources, reservoirs, treatments, or demand_zones; use get_incidents and get_maintenance for those records."""
     if dataset not in DATASETS:
         raise ValueError(f"dataset must be one of: {', '.join(DATASETS)}")
     assets = {asset["id"]: asset for asset in ENVIRONMENT[dataset]}
@@ -32,17 +61,17 @@ def get_asset_history(dataset: str, asset_ids: list[str], start: str, end: str) 
 
 
 def list_network_assets(asset_type: str) -> dict:
-    """List sources, reservoirs, treatments, demand_zones, incidents or maintenance records."""
-    if asset_type not in ("sources", "reservoirs", "treatments", "demand_zones", "incidents", "maintenance", "catchments", "connections"):
-        raise ValueError("Unsupported asset_type")
-    records = []
-    for item in ENVIRONMENT[asset_type]:
-        records.append({key: value for key, value in item.items() if key != "history"})
-    return envelope(tool="list_network_assets", source="Synthetic Network Registry", query={"asset_type": asset_type}, records=records, summary=f"Found {len(records)} {asset_type} records.")
+    """List network assets; singular and human-readable type aliases are accepted."""
+    resolved_asset_type = _resolve_asset_type(asset_type)
+    if resolved_asset_type == "rivers":
+        records = [{key: value for key, value in item.items() if key != "flow_history"} for item in ENVIRONMENT["rivers"].values()]
+    else:
+        records = [{key: value for key, value in item.items() if key != "history"} for item in ENVIRONMENT[resolved_asset_type]]
+    return envelope(tool="list_network_assets", source="Synthetic Network Registry", query={"asset_type": resolved_asset_type}, records=records, summary=f"Found {len(records)} {resolved_asset_type} records.")
 
 
 def get_incidents(start: str, end: str, status: str | None = None) -> dict:
-    """Query incidents whose start timestamp falls in a start-inclusive/end-exclusive range."""
+    """Query incidents whose start timestamp falls in a start-inclusive/end-exclusive range. To assess all currently open incidents, use the full available 30-day range and status='open'."""
     start_dt, end_dt = parse_time(start), parse_time(end)
     if start_dt >= end_dt:
         raise ValueError("start must be earlier than end")
@@ -61,7 +90,7 @@ def get_maintenance(start: str, end: str, asset_ids: list[str] | None = None) ->
 
 
 def run_supply_forecast(river_ids: list[str], horizon_days: int = 6) -> dict:
-    """Run a deterministic supply-demand forecast using explicit rivers for a 1-7 day horizon."""
+    """Run a deterministic supply-demand forecast using canonical river IDs from list_rivers for a 1-7 day horizon."""
     if horizon_days < 1 or horizon_days > 7:
         raise ValueError("horizon_days must be 1-7")
     unknown = [river_id for river_id in river_ids if river_id not in ENVIRONMENT["rivers"]]

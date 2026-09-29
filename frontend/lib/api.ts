@@ -1,4 +1,4 @@
-import type { Investigation, InvestigationCreated, StreamEvent } from "./types";
+import type { EvaluationReport, EvaluationRuntimeStatus, Investigation, InvestigationCreated, StreamEvent } from "./types";
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -26,6 +26,18 @@ export async function decide(id: string, decision: "approve" | "reject") {
   return response.json();
 }
 
+export async function getLatestEvaluation(): Promise<EvaluationReport | null> {
+  const response = await fetch(`${API_URL}/api/evaluations/latest`, { cache: "no-store" });
+  if (!response.ok) throw await apiError(response, "Could not load the latest evaluation report.");
+  return response.json();
+}
+
+export async function getEvaluationStatus(): Promise<EvaluationRuntimeStatus> {
+  const response = await fetch(`${API_URL}/api/evaluations/status`, { cache: "no-store" });
+  if (!response.ok) throw await apiError(response, "Could not load evaluation status.");
+  return response.json();
+}
+
 const EVENT_TYPES = ["run_started", "plan_updated", "activity_started", "activity_completed", "answer_delta", "clarification_required", "approval_required", "run_completed", "run_failed"];
 
 export function streamInvestigation(eventsUrl: string, after: number, onEvent: (event: StreamEvent) => void, onError: () => void): () => void {
@@ -41,4 +53,3 @@ export function streamInvestigation(eventsUrl: string, after: number, onEvent: (
   source.onerror = () => { source.close(); onError(); };
   return () => source.close();
 }
-

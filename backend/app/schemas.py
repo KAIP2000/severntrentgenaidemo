@@ -46,6 +46,7 @@ class Activity(BaseModel):
     result_summary: str | None = None
     evidence: list[Evidence] = Field(default_factory=list)
     calculations: list[Calculation] = Field(default_factory=list)
+    usage: dict[str, int] = Field(default_factory=dict)
     error: str | None = None
 
 
@@ -69,6 +70,7 @@ class AgentFinalResponse(BaseModel):
     """Provider-validated final response emitted after the tool loop."""
 
     status: Literal["complete", "clarification_required"]
+    disposition: Literal["conclusion", "insufficient_evidence", "conflicting_evidence", "no_action_required"] = "conclusion"
     title: str
     answer_markdown: str
     scope: dict[str, Any] = Field(default_factory=dict)
@@ -142,4 +144,3 @@ class DecisionAccepted(BaseModel):
     status: Literal["running"]
     events_url: str
     after: int
-

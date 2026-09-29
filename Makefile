@@ -1,4 +1,4 @@
-.PHONY: dev backend frontend test
+.PHONY: dev backend frontend test eval-test eval-seed eval-live
 
 dev:
 	docker compose up --build
@@ -12,3 +12,12 @@ frontend:
 test:
 	cd backend && ../.venv/bin/python -m pytest
 	cd frontend && npm run lint
+
+eval-test:
+	cd backend && ../.venv/bin/python -m pytest -q tests/test_evaluation.py
+
+eval-seed:
+	cd backend && ../.venv/bin/python -m app.evaluation.cli seed
+
+eval-live:
+	cd backend && ../.venv/bin/python -m app.evaluation.cli live

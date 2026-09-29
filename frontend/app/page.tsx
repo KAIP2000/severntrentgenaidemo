@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -123,9 +124,9 @@ export default function Home() {
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not record the decision."); }
   }
 
-  return <main className="shell"><aside className="rail"><div className="brandmark"><Waves weight="bold"/></div><nav><button className="railButton active"><Sparkle/></button><button className="railButton"><House/></button><button className="railButton"><MapTrifold/></button><button className="railButton"><ChartLineUp/></button><button className="railButton"><ClockCounterClockwise/></button></nav><div className="railBottom"><button className="railButton"><Bell/></button><div className="avatar">AJ</div></div></aside>
-    <section className="app"><header className="topbar"><div className="wordmark"><b>AQUA</b><span>OPS</span><small>INTELLIGENCE</small></div><div className="environment"><i/> Synthetic Midlands Network</div><div className="operator"><strong>Alex Johnson</strong><small>Duty Operations Manager</small></div></header>
-      <div className="workspace"><aside className="sidebar"><label>WORKSPACE</label><a><Gauge/>Overview</a><a className="active"><Sparkle/>AI investigations <span>{runs.length}</span></a><a><Warning/>Active alerts</a><label>NETWORK</label><a><Waves/>5 Rivers</a><a><Drop/>Supply</a><a><FlowArrow/>Treatment & demand</a><label>TRY ASKING</label>{prompts.map(prompt => <button className="quick" key={prompt} onClick={() => submit(prompt)}>{prompt}<ArrowRight/></button>)}<div className="systemCard"><i/><div><strong>Gemini agent online</strong><small>15 sensors · 60 intervals per river</small></div></div></aside>
+  return <main className="shell"><aside className="rail"><div className="brandmark"><Waves weight="bold"/></div><nav><button className="railButton active"><Sparkle/></button><button className="railButton"><House/></button><button className="railButton"><MapTrifold/></button><Link className="railButton" href="/evaluations" aria-label="Evaluations"><ChartLineUp/></Link><button className="railButton"><ClockCounterClockwise/></button></nav><div className="railBottom"><button className="railButton"><Bell/></button><div className="avatar">KP</div></div></aside>
+    <section className="app"><header className="topbar"><div className="wordmark"><b>SVTR</b><span>INTELLIGENCE</span></div><div className="environment"><i/> Synthetic Midlands Network</div><div className="operator"><strong>Kyle Pierre</strong><small>Duty Operations Manager</small></div></header>
+      <div className="workspace"><aside className="sidebar"><label>WORKSPACE</label><a><Gauge/>Overview</a><a className="active"><Sparkle/>AI investigations <span>{runs.length}</span></a><Link href="/evaluations"><ChartLineUp/>Evaluations</Link><a><Warning/>Active alerts</a><label>NETWORK</label><a><Waves/>5 Rivers</a><a><Drop/>Supply</a><a><FlowArrow/>Treatment & demand</a><label>TRY ASKING</label>{prompts.map(prompt => <button className="quick" key={prompt} onClick={() => submit(prompt)}>{prompt}<ArrowRight/></button>)}<div className="systemCard"><i/><div><strong>Gemini agent online</strong><small>15 sensors · 60 intervals per river</small></div></div></aside>
         <section className="content"><div className="hero"><span><Sparkle weight="fill"/> GEMINI-DRIVEN OPERATIONS</span><h1>Water operations,<br/><em>investigated live.</em></h1><p>Ask a question and watch Gemini choose the evidence, calculations, tools and specialists it needs.</p></div>
           <div className="timeline">{runs.length === 0 && <div className="empty"><Brain weight="duotone"/><h2>Start a conversation</h2><p>No river is assumed. If your scope is ambiguous, Gemini will ask.</p></div>}{runs.map(run => <Turn run={run} key={run.investigation_id} onDecision={decision}/>)}</div>
           {error && <div className="globalError"><Warning/>{error}<button onClick={() => setError("")}><X/></button></div>}
